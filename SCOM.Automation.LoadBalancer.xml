@@ -1,0 +1,493 @@
+﻿<?xml version="1.0" encoding="utf-8"?><ManagementPack ContentReadable="true" SchemaVersion="2.0" OriginalSchemaVersion="1.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <Manifest>
+    <Identity>
+      <ID>SCOM.Automation.LoadBalancer</ID>
+      <Version>1.0.0.3</Version>
+    </Identity>
+    <Name>SCOM Automation Agent Load Balancer</Name>
+    <References>
+      <Reference Alias="Windows">
+        <ID>Microsoft.Windows.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="System">
+        <ID>System.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="SC">
+        <ID>Microsoft.SystemCenter.Library</ID>
+        <Version>7.0.8448.6</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="Health">
+        <ID>System.Health.Library</ID>
+        <Version>7.0.8443.6</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+    </References>
+  </Manifest>
+  <TypeDefinitions>
+    <ModuleTypes>
+      <WriteActionModuleType ID="SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="MGName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="SCOMServerList" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="PercentAgentsThreshold" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />		  
+          <xsd:element minOccurs="1" name="TimeoutSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="PercentAgentsThreshold" Selector="$Config/PercentAgentsThreshold$" ParameterType="int" />		  
+          <OverrideableParameter ID="TimeoutSeconds" Selector="$Config/TimeoutSeconds$" ParameterType="int" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <WriteAction ID="WA" TypeID="Windows!Microsoft.Windows.PowerShellWriteAction">
+                <ScriptName>SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA.ps1</ScriptName>
+                <ScriptBody>
+#=================================================================================
+# Purpose: Load balances agents among a defined array of Management or Gateway Servers
+#
+# Author:  Kevin Holman
+# v1.3
+#=================================================================================
+param([string]$MGName,[string]$SCOMServerList,[int]$PercentAgentsThreshold)
+
+
+# Manual Testing section:
+#=================================================================================
+# [string]$MGName = "OM"
+# [string]$SCOMServerList = "MS1.domain.com,MS2.domain.com,MS3.domain.com" #SCOM Servers that we wish to load balance
+# [int]$PercentAgentsThreshold = 3  #Set this to the whole number percentage of total agents assigned to servers that will trigger a rebalance
+#=================================================================================
+
+
+# Constants section - modify stuff here:
+#=================================================================================
+# Assign script name variable for use in event logging
+$ScriptName = "SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA.ps1"
+$EventID = "8001"
+#=================================================================================
+
+
+# Starting Script section
+#=================================================================================
+# Gather the start time of the script
+$StartTime = Get-Date
+#Set variable to be used in logging events
+$whoami = whoami
+# Load MOMScript API
+$momapi = New-Object -comObject MOM.ScriptAPI
+#Log script event that we are starting task
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`nScript is starting. `nRunning as ($whoami). `nMGName: ($MGName). `nSCOM Server List: ($SCOMServerList). `nPercent of agents to trigger a rebalance: ($PercentAgentsThreshold).")
+#=================================================================================
+
+
+# Connect to local SCOM Management Group Section
+#=================================================================================
+# I have found this to be the most reliable method to load SCOM modules for scripts running on Management Servers
+# Clear any previous errors
+$Error.Clear()
+# Import the OperationsManager module and connect to the management group
+$SCOMPowerShellKey = "HKLM:\SOFTWARE\Microsoft\System Center Operations Manager\12\Setup\Powershell\V2"
+$SCOMModulePath = Join-Path (Get-ItemProperty $SCOMPowerShellKey).InstallDirectory "OperationsManager"
+Import-module $SCOMModulePath
+New-DefaultManagementGroupConnection "localhost"
+IF ($Error) 
+{ 
+  $momapi.LogScriptEvent($ScriptName,$EventID,1,"`nSCOM Server List: ($SCOMServerList). `nFATAL ERROR: Unable to load OperationsManager module or unable to connect to Management Server. `nTerminating script. `nError is: ($Error).")
+  EXIT
+}
+#=================================================================================
+
+
+# Begin MAIN script section
+#=================================================================================
+#Convert SCOMServerList string to array of Parents
+[array]$Parents = $SCOMServerList.Split(",")
+
+#Get all SCOM servers that should manage direct agents by name
+$ParentArr = Get-SCOMManagementServer | where {$_.Name -in $Parents} | Sort DisplayName
+$ParentCount = $ParentArr.Count
+
+IF ($ParentCount -lt 2)
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,2,"`nSCOM Server List: ($SCOMServerList). `nFATAL ERROR: Management Group: ($MGName). `nThis management group only returned ($ParentCount) Parent Servers (Management or GW Servers). `nMore than one Parent server is required for load balancing. `nTerminating script.")
+  EXIT
+}
+ELSE
+{
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nFound ($ParentCount) Parent Servers (Management or GW Servers) for load balancing. `nBegin getting SCOM Agents assigned to each Parent server now.")
+}
+
+# Some variable to temporarily store data in while neccesary.
+# Defining them like this is not really something you must do, but it helps for development and troubleshooting.
+[array]$ScomAgents = @()
+[hashtable]$AgentSettings = @{}
+[array]$TempAgents = @()
+[int]$TempAgentCount = 0
+$TempAgent = $null
+
+#Gather all agents into an array to avoid multiple trips to the SDK service later on
+FOREACH ($Parent in $ParentArr)
+{
+  $TempAgents = @(Get-SCOMAgent -ManagementServer $Parent)
+  $ParentName = $Parent.Name
+  $TempAgentsCount = $TempAgents.Count
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nParent Server: $($ParentName). `nAgents Assigned: $($TempAgentsCount)")
+  IF ($TempAgentsCount -gt 0)
+  {
+    # I do this check because an empty management server (new perhaps)
+    # will return one $null item which will get added to the $scomAgents
+    # array. Giving you too many items in the $scomAgents array, ruining the
+    # averaging calculation.
+    $ScomAgents += $TempAgents
+  }
+}
+
+# Total agents assigned to Management servers
+$SCOMAgentsCount = $ScomAgents.Count
+# Average agents rounded down to nearest whole number
+[int]$AverageAgents = [math]::Floor($SCOMAgentsCount / $ParentCount)
+[double]$ThresholdDecimal = ($PercentAgentsThreshold / 100)
+[int]$Threshold = [math]::Ceiling($SCOMAgentsCount * $ThresholdDecimal)   
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nCompleted getting all SCOM agents per MS. `nTotal Agents assigned to Management Servers: ($SCOMAgentsCount). `nTotal Management Servers: ($ParentCount). `nAverage agents per MS: ($AverageAgents). `nThreshold to trigger rebalancing is greater than ($Threshold) agents.")
+
+# Determine if we should continue or not based on threshold of agents to move
+# This section will check all MS to see if ANY MS has too many agents and set Rebalance to True
+$Rebalance = $null
+FOREACH ($Parent in $ParentArr)
+{
+  $ParentAgents = $ScomAgents | WHERE {$_.PrimaryManagementServerName -eq $Parent.Name}
+  $ParentAgentsCount = $ParentAgents.Count
+  #We only care about MS with too many agents
+  IF ($ParentAgentsCount -gt $AverageAgents)
+  {
+    $ParentAgentDiff = ($ParentAgentsCount - $AverageAgents)
+    IF ($ParentAgentDiff -gt $Threshold)
+    {
+      $Rebalance = $true
+    }
+  }
+}
+
+#Stop script if the agent balance does not warrant the impact of moving agents
+IF (!($Rebalance))
+{
+  #Log an event for script ending and total execution time.
+  $EndTime = Get-Date
+  $ScriptTime = ($EndTime - $StartTime).TotalSeconds
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nNo Parent Servers are over the agent count threshold to trigger rebalance. `nScript Runtime: ($ScriptTime) seconds.")
+  EXIT
+}
+
+# Continue assuming Rebalance is true
+[array]$BelowAverageParent = @()
+[array]$MovableAgents = @()
+[array]$TempAgents = @()
+# $modAgents will be the "left-overs" after the flooring.
+$ModAgents = $SCOMAgentsCount % $ParentCount
+
+#Build an array of movable agents and management servers under the average agents
+FOREACH ($Parent in $ParentArr)
+{
+  $TempAgents = $ScomAgents | WHERE {$_.PrimaryManagementServerName -eq $Parent.Name}
+  [int]$TempAgentCount = $TempAgents.Count
+  IF ($TempAgentCount -gt $AverageAgents)
+  {
+    $TempAgents = ($ScomAgents | WHERE {($_.PrimaryManagementServerName -eq $Parent.Name)})
+    IF ($ModAgents -gt 0)
+    {
+      $AgentDiff = [int]($TempAgentCount - $AverageAgents - 1)
+      $ModAgents--
+    }
+    ELSE
+    {
+      $AgentDiff = [int]($TempAgentCount - $AverageAgents)
+    }
+    IF ($AgentDiff -ge 1)
+    {
+      # We're picking movable agents at random here to minimize the risk that
+      # the same agents are moved every time we run this script.
+      $TempAgents = $TempAgents | Get-Random -Count $AgentDiff
+      $MovableAgents += $TempAgents
+    }
+  }
+  ELSE
+  {
+    $BelowAverageParent += $Parent
+  }
+}
+$MovableAgentsCount = $MovableAgents.Count
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nTotal Movable Agents: ($MovableAgentsCount)")
+
+# At this point we have $MovableAgents which contains all agents that need to be moved to maintain balance across the management servers.
+# We also have $BelowAverageParent that has all the management servers that currently have below the average agent count.
+# Next parse the $BelowAverageMS array and assign the $AgentDiff number of Agents from $movableAgents to it. The agent and the MS will be added to a hashtable for speed
+
+FOREACH ($Parent in $BelowAverageParent)
+{
+  $TempAgents = $ScomAgents | WHERE {$_.PrimaryManagementServerName -eq $Parent.Name}
+  [int]$TempAgentCount = $TempAgents.Count
+  [int]$AgentDiff = $AverageAgents - $TempAgentCount
+  IF ($AgentDiff -gt 0)
+  {
+    IF ($MovableAgents.Count -ge $AgentDiff)
+    {
+      # Selecting at random again
+      $TempAgents = $MovableAgents | Get-Random -Count $AgentDiff
+    }
+    ELSE
+    {
+      #There are less movable agents than this Parent is low from the average so move them all here
+      $TempAgents = $MovableAgents
+    }
+    FOREACH ($TempAgent in $TempAgents)
+    {
+      # Looping through and removing the agents we are about to assign from the MovableAgents array
+      $MovableAgents = $MovableAgents | where {$_.PrincipalName -ne $TempAgent.PrincipalName}
+    }
+    FOREACH ($ScomAgent in $TempAgents)
+    {
+      # Add the agent and Parent to the $agentSettings hashtable
+      $AgentSettings.Add($ScomAgent,$Parent)
+    }
+  }
+}
+
+# We need to handle the scenario that one MS can have two or more agents surplus
+# (that is, $modAgents are greater than 2) and all the rest of the management servers are
+# spot on "average" as this case is not caught by the above loop.
+# It is easily spotted as $movableAgents still is not empty or $null.
+WHILE ($MovableAgents.Count -gt 0)
+{
+  FOREACH ($Parent in $BelowAverageParent)
+  {
+    $TempAgent = $MovableAgents | Get-Random
+    $AgentSettings.Add($TempAgent,$Parent)
+    $MovableAgents = $MovableAgents | WHERE {$_.PrincipalName -ne $TempAgent.PrincipalName}
+    IF ($MovableAgents.Count -lt 1)
+    {
+      break
+    }
+  }
+}
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nStarting to Load balance the agents")
+
+# Loop through the $agentSettings hashtable containing agent/primaryMS key/value pairs.
+# Use the primaryMS to get Fail-over MSs (all the rest), build the required and
+# run SetManagementServers() to execute.
+FOREACH ($AgentSetting in $AgentSettings.GetEnumerator())
+{
+  $ScomAgent = $AgentSetting.Key
+  $ScomPrimaryParent = $AgentSetting.Value
+  $ScomFailOverParents = @($ParentArr | where {$_.Name -ne $ScomPrimaryParent.Name})
+  $ScomFailOverList = New-Object 'Collections.Generic.List[Microsoft.EnterpriseManagement.Administration.ManagementServer]'
+  FOREACH ($ScomFailOverParent in $ScomFailOverParents)
+  {
+    $ScomFailoverList.Add($ScomFailOverParent)
+  }
+  $FailoverCount = $ScomFailoverList.Count
+  $SCOMAgentName = $ScomAgent.Name
+  $SCOMPrimaryParentName = $ScomPrimaryParent.Name
+  $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nAgent: ($SCOMAgentName). `nNew Primary Parent: ($SCOMPrimaryParentName). `nFailover MS count: ($FailoverCount).")
+  $ScomAgent.SetManagementServers($ScomPrimaryParent,$ScomFailOverList)
+}
+#=================================================================================
+# End MAIN script section
+
+
+# End of script section
+#=================================================================================
+#Log an event for script ending and total execution time.
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+$momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerList). `nScript Completed. `nScript Runtime: ($ScriptTime) seconds.")
+#=================================================================================
+# End of script
+                </ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>MGName</Name>
+                    <Value>$Config/MGName$</Value>
+                  </Parameter>
+			      <Parameter>
+                    <Name>SCOMServerList</Name>
+                    <Value>$Config/SCOMServerList$</Value>
+                  </Parameter>
+			      <Parameter>
+                    <Name>PercentAgentsThreshold</Name>
+                    <Value>$Config/PercentAgentsThreshold$</Value>
+                  </Parameter>			  
+                </Parameters>	
+                <TimeoutSeconds>$Config/TimeoutSeconds$</TimeoutSeconds>
+              </WriteAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="WA" />
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.BaseData</OutputType>
+        <InputType>System!System.BaseData</InputType>
+      </WriteActionModuleType>
+    </ModuleTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Rules>
+      <Rule ID="SCOM.Automation.LoadBalancer.AlertOnScriptError.Rule" Enabled="true" Target="SC!Microsoft.SystemCenter.CollectionManagementServer" ConfirmDelivery="true" Remotable="true" Priority="Normal" DiscardLevel="100">
+        <Category>Alert</Category>
+        <DataSources>
+          <DataSource ID="DS" TypeID="Windows!Microsoft.Windows.EventProvider">
+            <ComputerName>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/NetworkName$</ComputerName>
+            <LogName>Operations Manager</LogName>
+            <Expression>
+              <And>
+                <Expression>
+                  <SimpleExpression>
+                    <ValueExpression>
+                      <XPathQuery Type="UnsignedInteger">EventDisplayNumber</XPathQuery>
+                    </ValueExpression>
+                    <Operator>Equal</Operator>
+                    <ValueExpression>
+                      <Value Type="UnsignedInteger">8001</Value>
+                    </ValueExpression>
+                  </SimpleExpression>
+                </Expression>
+                <Expression>
+                  <SimpleExpression>
+                    <ValueExpression>
+                      <XPathQuery Type="String">PublisherName</XPathQuery>
+                    </ValueExpression>
+                    <Operator>Equal</Operator>
+                    <ValueExpression>
+                      <Value Type="String">Health Service Script</Value>
+                    </ValueExpression>
+                  </SimpleExpression>
+                </Expression>
+                <Expression>
+                  <RegExExpression>
+                    <ValueExpression>
+                      <XPathQuery Type="String">Params/Param[1]</XPathQuery>
+                    </ValueExpression>
+                    <Operator>ContainsSubstring</Operator>
+                    <Pattern>SCOM.Automation.LoadBalancer</Pattern>
+                  </RegExExpression>
+                </Expression>
+                <Expression>
+                  <RegExExpression>
+                    <ValueExpression>
+                      <XPathQuery Type="Integer">EventLevel</XPathQuery>
+                    </ValueExpression>
+                    <Operator>MatchesRegularExpression</Operator>
+                    <Pattern>^(1|2)$</Pattern>
+                  </RegExExpression>
+                </Expression>
+              </And>
+            </Expression>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="Alert" TypeID="Health!System.Health.GenerateAlert">
+            <Priority>1</Priority>
+            <Severity>0</Severity>
+            <AlertName />
+            <AlertDescription />
+            <AlertOwner />
+            <AlertMessageId>$MPElement[Name="SCOM.Automation.LoadBalancer.AlertOnScriptError.Rule.AlertMessage"]$</AlertMessageId>
+            <AlertParameters>
+              <AlertParameter1>$Data[Default='']/EventDescription$</AlertParameter1>
+            </AlertParameters>
+            <Suppression />
+            <Custom1 />
+            <Custom2 />
+            <Custom3 />
+            <Custom4 />
+            <Custom5 />
+            <Custom6 />
+            <Custom7 />
+            <Custom8 />
+            <Custom9 />
+            <Custom10 />
+          </WriteAction>
+        </WriteActions>
+      </Rule>
+      <Rule ID="SCOM.Automation.LoadBalancer.AgentLoadBalancerMS.Rule" Enabled="false" Target="SC!Microsoft.SystemCenter.AllManagementServersPool" ConfirmDelivery="true" Remotable="true" Priority="Normal" DiscardLevel="100">
+        <Category>Maintenance</Category>
+        <DataSources>
+          <DataSource ID="DS" TypeID="System!System.Scheduler">
+            <Scheduler>
+              <SimpleReccuringSchedule>
+                <Interval Unit="Seconds">86400</Interval>
+                <SyncTime>05:01</SyncTime>
+              </SimpleReccuringSchedule>
+              <ExcludeDates />
+            </Scheduler>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="WA" TypeID="SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA">
+            <MGName>$Target/ManagementGroup/Name$</MGName>
+			<SCOMServerList>MS1.domain.com,MS1.domain.com,MS1.domain.com</SCOMServerList>
+			<PercentAgentsThreshold>3</PercentAgentsThreshold>
+            <TimeoutSeconds>900</TimeoutSeconds>
+          </WriteAction>
+        </WriteActions>
+      </Rule>
+      <Rule ID="SCOM.Automation.LoadBalancer.AgentLoadBalancerGW.Rule" Enabled="false" Target="SC!Microsoft.SystemCenter.AllManagementServersPool" ConfirmDelivery="true" Remotable="true" Priority="Normal" DiscardLevel="100">
+        <Category>Maintenance</Category>
+        <DataSources>
+          <DataSource ID="DS" TypeID="System!System.Scheduler">
+            <Scheduler>
+              <SimpleReccuringSchedule>
+                <Interval Unit="Seconds">86400</Interval>
+                <SyncTime>06:01</SyncTime>
+              </SimpleReccuringSchedule>
+              <ExcludeDates />
+            </Scheduler>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="WA" TypeID="SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA">
+            <MGName>$Target/ManagementGroup/Name$</MGName>
+			<SCOMServerList>GW1.domain.com,GW2.domain.com</SCOMServerList>
+			<PercentAgentsThreshold>3</PercentAgentsThreshold>
+            <TimeoutSeconds>900</TimeoutSeconds>
+          </WriteAction>
+        </WriteActions>
+      </Rule>
+    </Rules>
+  </Monitoring>
+  <Presentation>
+    <StringResources>
+      <StringResource ID="SCOM.Automation.LoadBalancer.AlertOnScriptError.Rule.AlertMessage" />
+    </StringResources>
+  </Presentation>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="true">
+      <DisplayStrings>
+        <DisplayString ElementID="SCOM.Automation.LoadBalancer">
+          <Name>SCOM Automation Agent Load Balancer</Name>
+        </DisplayString>
+        <DisplayString ElementID="SCOM.Automation.LoadBalancer.AlertOnScriptError.Rule">
+          <Name>SCOM Automation Script Error Rule</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="SCOM.Automation.LoadBalancer.AlertOnScriptError.Rule.AlertMessage">
+          <Name>Error running a SCOM Automation LoadBalancer Script</Name>
+          <Description>Event Description: {0}</Description>
+        </DisplayString>
+        <DisplayString ElementID="SCOM.Automation.LoadBalancer.AgentLoadBalancerMS.Rule">
+          <Name>SCOM Automation Agent Load Balancer MS Rule</Name>
+          <Description>PowerShell script rule to load balance Agents among Management servers</Description>
+        </DisplayString>
+        <DisplayString ElementID="SCOM.Automation.LoadBalancer.AgentLoadBalancerGW.Rule">
+          <Name>SCOM Automation Agent Load Balancer GW Rule</Name>
+          <Description>PowerShell script rule to load balance Agents among Gateway servers</Description>
+        </DisplayString>
+      </DisplayStrings>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPack>
