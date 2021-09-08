@@ -431,7 +431,7 @@ $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerL
           <WriteAction ID="WA" TypeID="SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA">
             <MGName>$Target/ManagementGroup/Name$</MGName>
 			<SCOMServerList>MS1.domain.com,MS1.domain.com,MS1.domain.com</SCOMServerList>
-			<PercentAgentsThreshold>3</PercentAgentsThreshold>
+			<PercentAgentsThreshold>5</PercentAgentsThreshold>
             <TimeoutSeconds>900</TimeoutSeconds>
           </WriteAction>
         </WriteActions>
@@ -453,7 +453,7 @@ $momapi.LogScriptEvent($ScriptName,$EventID,0,"`nSCOM Server List: ($SCOMServerL
           <WriteAction ID="WA" TypeID="SCOM.Automation.LoadBalancer.AgentLoadBalancer.WA">
             <MGName>$Target/ManagementGroup/Name$</MGName>
 			<SCOMServerList>GW1.domain.com,GW2.domain.com</SCOMServerList>
-			<PercentAgentsThreshold>3</PercentAgentsThreshold>
+			<PercentAgentsThreshold>5</PercentAgentsThreshold>
             <TimeoutSeconds>900</TimeoutSeconds>
           </WriteAction>
         </WriteActions>
