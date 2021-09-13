@@ -18,12 +18,12 @@
       </Reference>
       <Reference Alias="SC">
         <ID>Microsoft.SystemCenter.Library</ID>
-        <Version>7.0.8448.6</Version>
+        <Version>7.0.8433.0</Version>
         <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
       </Reference>
       <Reference Alias="Health">
         <ID>System.Health.Library</ID>
-        <Version>7.0.8443.6</Version>
+        <Version>7.0.8433.0</Version>
         <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
       </Reference>
     </References>
